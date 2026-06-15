@@ -6,9 +6,6 @@ param(
     [string]$Username = $env:USERNAME.ToLower(),
     [string]$Hostname = "$env:COMPUTERNAME-void".ToLower(),
     [string]$Timezone = 'America/New_York',
-    # Void ships two ROOTFS variants -- glibc (default, most software just
-    # works) and musl (smaller, stricter, fewer pre-built packages). Pick
-    # via -Libc glibc | musl.
     [ValidateSet('glibc','musl')]
     [string]$Libc = 'glibc',
     [string]$RootfsBase = 'https://repo-default.voidlinux.org/live/current',
@@ -25,7 +22,6 @@ function Fail([string]$msg) { Write-Host "[FAIL] $msg"     -ForegroundColor Red;
 
 $WSL = "$env:WINDIR\System32\wsl.exe"
 
-# ---- 1. preflight ----
 Say "preflight"
 
 function Install-WSL-IfMissing {
@@ -68,8 +64,6 @@ if ($existing -and -not $Force) {
     OK "old '$DistroName' unregistered"
 }
 
-# ---- 1b. interactive username + password ----
-# Default username = Windows username lower-cased, but let the user override.
 Write-Host ""
 Say "user setup"
 $usernameInput = Read-Host "Linux username [$Username]"
@@ -109,7 +103,6 @@ if ($useSamePw -eq 'n' -or $useSamePw -eq 'N') {
 }
 OK "credentials captured"
 
-# ---- 2. discover the latest ROOTFS tarball ----
 Say "discovering latest void-x86_64-$Libc-ROOTFS from $RootfsBase"
 $sumsUrl = "$RootfsBase/sha256sum.txt"
 try {
@@ -119,7 +112,7 @@ try {
 # Void's sha256sum.txt lines look like:
 #   SHA256 (void-x86_64-ROOTFS-20250202.tar.xz) = <hex>
 #   SHA256 (void-x86_64-musl-ROOTFS-20250202.tar.xz) = <hex>
-# We pick the x86_64 line matching the requested libc.
+# If upstream ever changes that format, this regex is what to edit.
 if ($Libc -eq 'glibc') {
     $needle = '^SHA256 \(void-x86_64-ROOTFS-(\d+)\.tar\.xz\) = ([0-9a-f]{64})$'
 } else {
@@ -140,7 +133,6 @@ if ($Libc -eq 'glibc') {
 $stageUrl = "$RootfsBase/$stageFilename"
 OK "latest: $stageFilename"
 
-# ---- 3. preparing dirs ----
 Say "preparing dirs"
 New-Item -ItemType Directory -Path $DownloadDir -Force | Out-Null
 New-Item -ItemType Directory -Path $InstallPath -Force | Out-Null
@@ -161,8 +153,6 @@ function Get-Sha256Hex([string]$path) {
     return ([System.BitConverter]::ToString($bytes) -replace '-','').ToLower()
 }
 
-# Reuse a cached tarball iff its hash matches the upstream sha256sum.txt
-# entry we just parsed.  Otherwise re-download.
 $needDownload = $true
 if (Test-Path $stageFile) {
     Say "checking cached tarball at $stageFile"
@@ -192,7 +182,6 @@ if ($expectedSha256.ToLower() -ne $actual) {
 }
 OK "sha256 verified ($actual)"
 
-# ---- 4. wsl import ----
 Say "wsl --import $DistroName"
 $swImport = [System.Diagnostics.Stopwatch]::StartNew()
 & $WSL --import $DistroName $InstallPath $stageFile --version 2 2>&1 | Out-Null
@@ -200,16 +189,8 @@ if ($LASTEXITCODE -ne 0) { Fail "wsl --import failed (rc=$LASTEXITCODE)" }
 $swImport.Stop()
 OK "imported in $([math]::Round($swImport.Elapsed.TotalSeconds,1))s"
 
-# ---- 5. first-boot setup inside the distro ----
 Say "writing /etc/wsl.conf, creating user '$Username', xbps update + base install"
 
-# The setup script that runs INSIDE the distro as root.
-# Variables interpolated from PowerShell:
-#   $u   -- username
-#   $h   -- hostname
-#   $tz  -- timezone
-#   $rpw -- root password (captured interactively)
-#   $upw -- user password (captured interactively)
 $u   = $Username
 $h   = $Hostname
 $tz  = $Timezone
@@ -219,7 +200,6 @@ $upw = $UserPassword
 $setupScript = @"
 set -e
 
-# /etc/wsl.conf
 cat > /etc/wsl.conf << 'EOF'
 [boot]
 systemd=false
@@ -232,66 +212,41 @@ generateHosts=true
 generateResolvConf=true
 
 [interop]
-# enabled=true keeps explorer.exe / code.exe / etc. callable when you
-# explicitly want to cross over to Windows.
 enabled=true
-# but appendWindowsPath=false stops Windows PATH from being unionised
-# into the Linux PATH -- so `kcc` resolves to the Linux install, never
-# to C:\Users\...\kcc.exe.
 appendWindowsPath=false
 
 [automount]
 enabled=true
-# noexec on /mnt/c blocks executing Windows binaries from inside WSL even
-# if you call them by full path -- prevents accidentally running a stray
-# Windows kcc.exe / etc.exe when you meant the Linux native version.
-# Read + list still work, so cd /mnt/c/... is fine for inspection.
 options="metadata,umask=22,fmask=11,noexec"
 EOF
 
-# hostname + timezone
 echo '$h' > /etc/hostname
 ln -sf /usr/share/zoneinfo/$tz /etc/localtime 2>/dev/null || true
 echo '$tz' > /etc/timezone 2>/dev/null || true
 
-# Void ships without /var/spool/mail in the base ROOTFS, which makes
-# useradd warn 'Creating mailbox file: No such file or directory' on
-# stderr.  Pre-create so the install runs silently.
 mkdir -p /var/spool/mail
 chmod 0775 /var/spool/mail
 
-# Update xbps first (Void's strong recommendation -- xbps-install -Syu
-# can refuse to proceed if xbps itself is older than what the repos
-# expect).  Then full system update, then base tools.
 echo '--- xbps-install -Sy xbps ---'
-xbps-install -Sy xbps 2>&1 | tail -5
+xbps-install -Sy xbps
 echo '--- xbps-install -Syu ---'
-xbps-install -Syu 2>&1 | tail -5
+xbps-install -Syu
 echo '--- install base tools ---'
-xbps-install -Sy sudo nano 2>&1 | tail -5
+xbps-install -Sy sudo nano
 
-# Passwords captured interactively on the Windows side.  PAM in Void
-# enforces a minimum length so the installer's prompt loop already
-# filters short inputs.
 echo 'root:$rpw' | chpasswd
 useradd -m -G wheel,users -s /bin/bash $u
 echo "${u}:$upw" | chpasswd
 
-# wheel sudo (Void's default sudoers ships with the line commented).
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
 echo '--- setup done ---'
 "@
 
 $tmpScript = Join-Path $env:TEMP "void-setup-$([Guid]::NewGuid().ToString('N').Substring(0,8)).sh"
-# Set-Content -Encoding UTF8 in PS 5.1 prepends a BOM which bash chokes on,
-# and the PowerShell here-string uses Windows CRLF line endings which bash
-# also chokes on (sees `set -e\r` -> `-e\r` as an invalid flag). Normalise
-# both before writing.
 $setupScript = $setupScript -replace "`r`n", "`n"
 [System.IO.File]::WriteAllText($tmpScript, $setupScript, [System.Text.UTF8Encoding]::new($false))
 
-# Convert Windows path -> WSL path via the distro's wslpath
 $wslPath = (& $WSL -d $DistroName -u root -e wslpath -u "$tmpScript" 2>&1).Trim()
 if ([string]::IsNullOrWhiteSpace($wslPath)) { Fail "wslpath returned empty for $tmpScript" }
 
@@ -300,7 +255,6 @@ if ($LASTEXITCODE -ne 0) { Fail "in-distro setup failed (rc=$LASTEXITCODE)" }
 Remove-Item -Path $tmpScript -Force -ErrorAction SilentlyContinue
 OK "in-distro setup complete"
 
-# ---- 6. bounce + verify ----
 Say "bouncing distro so default user takes effect"
 & $WSL --terminate $DistroName 2>&1 | Out-Null
 Start-Sleep -Seconds 2
@@ -312,7 +266,6 @@ try {
     Warn "smoke test threw: $_  (distro is probably fine - manually verify with: wsl -d $DistroName)"
 }
 
-# ---- 7. summary ----
 Write-Host ""
 Write-Host "=========================================" -ForegroundColor Green
 Write-Host "  Void installed and ready"                  -ForegroundColor Green
